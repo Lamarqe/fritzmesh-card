@@ -3,6 +3,8 @@ Home Assistant card to display the network Mesh of your Fritz!Box
 
 <img src="screenshots/card.jpg" width="600">
 
+:exclamation: **This card is based on the work of [werthdavid](https://github.com/werthdavid). 90% of the implementation has been extracted from [homeassistant-fritzmesh](https://github.com/werthdavid/homeassistant-fritzmesh).**
+
 ## Using the card
 
 - Find the ID of the topology entity of the mesh master (e.g. `sensor.fritz_box_connected_devices`)
