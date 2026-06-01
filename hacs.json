@@ -1,0 +1,5 @@
+{
+  "name": "Fritz!Mesh - display the Mesh network of your Fritz!Box",
+  "content_in_root": true,
+  "filename": "fritzmesh-card.js"
+}
