@@ -703,46 +703,6 @@ ve
     this._wireClientActions();
   }
 
-  debugLayout() {
-    const sr = this.shadowRoot;
-    const pick = (el, props) => {
-      if (!el) return "(not found)";
-      const cs = getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      const out = { w: Math.round(r.width), h: Math.round(r.height) };
-      props.forEach(p => { out[p] = cs[p]; });
-      return out;
-    };
-
-    const host      = this;
-    const haCard    = sr.querySelector("ha-card");
-    const cardBody  = sr.querySelector(".card-body");
-    const masterCol = sr.querySelector(".master-col");
-    const panel     = sr.querySelector(".master-panel");
-    const tree      = sr.querySelector(".tree");
-
-    console.group("[fritzmesh-card] layout debug  v" + CARD_VERSION);
-    console.log(":host",        pick(host,      ["overflow","height","display"]));
-    console.log("ha-card",      pick(haCard,    ["overflow","height","display","flexDirection"]));
-    console.log(".card-body",   pick(cardBody,  ["overflow","height","display","flexDirection","alignItems"]));
-    console.log(".master-col",  pick(masterCol, ["overflow","height","display","flexDirection"]));
-    console.log(".master-panel",pick(panel,     ["position","top","overflow","height"]));
-    console.log(".tree",        pick(tree,      ["overflow","overflowY","height","alignSelf"]));
-
-    // Walk up from .master-panel to find the nearest scrollable ancestor
-    let el = panel?.parentElement;
-    const chain = [];
-    while (el && el !== document.body) {
-      const cs = getComputedStyle(el);
-      const ov = cs.overflow + "/" + cs.overflowY;
-      const scrollable = /(auto|scroll)/.test(ov);
-      chain.push({ tag: el.tagName + (el.className ? "." + el.className.trim().split(/\s+/)[0] : ""), overflow: ov, scrollable });
-      el = el.parentElement ?? el.getRootNode()?.host;
-    }
-    console.log("scroll ancestor chain (from panel up):", chain);
-    console.groupEnd();
-  }
-
   _wireClientActions() {
     const actionEls = this.shadowRoot.querySelectorAll(".client-action");
     actionEls.forEach((el) => {
