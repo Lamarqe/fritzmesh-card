@@ -1,4 +1,4 @@
-# fritzmesh-card
+# Fritz!Mesh card
 Home Assistant card to display the network Mesh of your Fritz!Box
 
 <img src="screenshots/card.jpg" width="600">
