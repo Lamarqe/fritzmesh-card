@@ -6,7 +6,7 @@
  * fritz integration entities (no custom fritzmesh component needed):
  *
  *   • sensor.*_mesh_connected_devices  – one per mesh node (master, slaves, and switches);
- *     carries node_name, node_type, is_master, fritz_unique_id, fritz_host, node_mac,
+ *     carries node_name, node_type, is_master, fritz_unique_id, fritz_host, node_uid,
  *     rx_rate_kbps, tx_rate_kbps in its attributes.
  *   • device_tracker.*                 – one per client device; carries
  *     connected_to, connection_type, ip, mac, cur_rx_kbps, cur_tx_kbps.
@@ -354,7 +354,7 @@ class FritzMeshCard extends HTMLElement {
     const masterNode = {
       name: masterAttrs.node_name ?? "Fritz!Box",
       is_master: true,
-      node_mac: masterAttrs.node_mac ?? "",
+      node_uid: masterAttrs.node_uid ?? "",
       rx_rate_kbps: masterAttrs.rx_rate_kbps ?? null,
       tx_rate_kbps: masterAttrs.tx_rate_kbps ?? null,
       clients: [],
@@ -378,18 +378,18 @@ class FritzMeshCard extends HTMLElement {
             name: a.node_name,
             is_master: false,
             node_type: "switch",
-            node_mac: a.node_mac ?? "",
+            node_uid: a.node_uid ?? "",
             rx_rate_kbps: a.rx_rate_kbps ?? null,
             tx_rate_kbps: a.tx_rate_kbps ?? null,
             clients: [],
           };
           switchNodes.push(switchNode);
-          nodesByName[a.node_mac] = switchNode;
+          nodesByName[a.node_uid] = switchNode;
         } else {
           const slave = {
             name: a.node_name,
             is_master: false,
-            node_mac: a.node_mac ?? "",
+            node_uid: a.node_uid ?? "",
             rx_rate_kbps: a.rx_rate_kbps ?? null,
             tx_rate_kbps: a.tx_rate_kbps ?? null,
             parent_link_type: "LAN", // resolved below
@@ -436,8 +436,8 @@ class FritzMeshCard extends HTMLElement {
     // parent_node from the sensor attribute takes priority and is not overwritten.
     if (slaveNodes.length) {
       for (const slave of slaveNodes) {
-        if (!slave.node_mac) continue;
-        const macNorm = slave.node_mac.toUpperCase().replace(/[^0-9A-F]/g, "");
+        if (!slave.node_uid) continue;
+        const macNorm = slave.node_uid.toUpperCase().replace(/[^0-9A-F]/g, "");
         for (const [eid, s] of Object.entries(this._hass.states)) {
           if (!eid.startsWith("device_tracker.")) continue;
           const a = s?.attributes ?? {};
@@ -453,7 +453,7 @@ class FritzMeshCard extends HTMLElement {
 
     // Attach slaves whose uplink goes via a switch as children of that switch.
     // They will be rendered nested inside the switch section instead of at root.
-    const switchKeysByMac = new Set(switchNodes.map((sw) => sw.node_mac));
+    const switchKeysByMac = new Set(switchNodes.map((sw) => sw.node_uid));
     for (const slave of slaveNodes) {
       if (slave.parent_node && switchKeysByMac.has(slave.parent_node)) {
         const parentSwitch = nodesByName[slave.parent_node];
@@ -703,6 +703,46 @@ ve
     this._wireClientActions();
   }
 
+  debugLayout() {
+    const sr = this.shadowRoot;
+    const pick = (el, props) => {
+      if (!el) return "(not found)";
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      const out = { w: Math.round(r.width), h: Math.round(r.height) };
+      props.forEach(p => { out[p] = cs[p]; });
+      return out;
+    };
+
+    const host      = this;
+    const haCard    = sr.querySelector("ha-card");
+    const cardBody  = sr.querySelector(".card-body");
+    const masterCol = sr.querySelector(".master-col");
+    const panel     = sr.querySelector(".master-panel");
+    const tree      = sr.querySelector(".tree");
+
+    console.group("[fritzmesh-card] layout debug  v" + CARD_VERSION);
+    console.log(":host",        pick(host,      ["overflow","height","display"]));
+    console.log("ha-card",      pick(haCard,    ["overflow","height","display","flexDirection"]));
+    console.log(".card-body",   pick(cardBody,  ["overflow","height","display","flexDirection","alignItems"]));
+    console.log(".master-col",  pick(masterCol, ["overflow","height","display","flexDirection"]));
+    console.log(".master-panel",pick(panel,     ["position","top","overflow","height"]));
+    console.log(".tree",        pick(tree,      ["overflow","overflowY","height","alignSelf"]));
+
+    // Walk up from .master-panel to find the nearest scrollable ancestor
+    let el = panel?.parentElement;
+    const chain = [];
+    while (el && el !== document.body) {
+      const cs = getComputedStyle(el);
+      const ov = cs.overflow + "/" + cs.overflowY;
+      const scrollable = /(auto|scroll)/.test(ov);
+      chain.push({ tag: el.tagName + (el.className ? "." + el.className.trim().split(/\s+/)[0] : ""), overflow: ov, scrollable });
+      el = el.parentElement ?? el.getRootNode()?.host;
+    }
+    console.log("scroll ancestor chain (from panel up):", chain);
+    console.groupEnd();
+  }
+
   _wireClientActions() {
     const actionEls = this.shadowRoot.querySelectorAll(".client-action");
     actionEls.forEach((el) => {
@@ -809,7 +849,7 @@ ve
       return sorted;
     }
     if (mode === "mac") {
-      sorted.sort((a, b) => this._compareMac(a?.node_mac, b?.node_mac) || this._compareName(a?.name, b?.name));
+      sorted.sort((a, b) => this._compareMac(a?.node_uid, b?.node_uid) || this._compareName(a?.name, b?.name));
       return sorted;
     }
     if (mode === "ip") {
