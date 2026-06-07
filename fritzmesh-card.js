@@ -6,7 +6,7 @@
  * fritz integration entities (no custom fritzmesh component needed):
  *
  *   • sensor.*_mesh_connected_devices  – one per mesh node (master, slaves, and switches);
- *     carries node_name, node_type, is_master, fritz_unique_id, fritz_host, node_uid,
+ *     carries node_name, node_type, fritz_unique_id, fritz_host, node_uid,
  *     rx_rate_kbps, tx_rate_kbps in its attributes.
  *   • device_tracker.*                 – one per client device; carries
  *     connected_to, connection_type, ip, mac, cur_rx_kbps, cur_tx_kbps.
@@ -270,7 +270,7 @@ class FritzMeshCard extends HTMLElement {
       const trackerStates = {};
       for (const [eid, s] of Object.entries(hass.states)) {
         const a = s?.attributes ?? {};
-        if (eid.startsWith("sensor.") && a.fritz_unique_id === fritzUid && a.is_master === false) {
+        if (eid.startsWith("sensor.") && a.fritz_unique_id === fritzUid && a.node_type !== "master") {
           if (a.node_type === "switch") {
             switchAttrs[eid] = a;
           } else {
@@ -318,7 +318,7 @@ class FritzMeshCard extends HTMLElement {
    * Main render method: build topology from fritz integration entities.
    *
    * 1. Read master node attrs from the configured sensor entity.
-   * 2. Discover slave nodes: sensors with matching fritz_unique_id and is_master=false.
+   * 2. Discover slave nodes: sensors with matching fritz_unique_id and node_type!=master.
    * 3. Assign clients: device_tracker entities whose connected_to matches a node name.
    * 4. Determine slave uplink type from the slave's device_tracker (if found).
    */
@@ -353,7 +353,7 @@ class FritzMeshCard extends HTMLElement {
     // Build master node object.
     const masterNode = {
       name: masterAttrs.node_name ?? "Fritz!Box",
-      is_master: true,
+      node_type: "master",
       node_uid: masterAttrs.node_uid ?? "",
       rx_rate_kbps: masterAttrs.rx_rate_kbps ?? null,
       tx_rate_kbps: masterAttrs.tx_rate_kbps ?? null,
@@ -370,13 +370,12 @@ class FritzMeshCard extends HTMLElement {
       if (
         eid.startsWith("sensor.") &&
         a.fritz_unique_id === fritzUid &&
-        a.is_master === false &&
+        a.node_type !== "master" &&
         a.node_name
       ) {
         if (a.node_type === "switch") {
           const switchNode = {
             name: a.node_name,
-            is_master: false,
             node_type: "switch",
             node_uid: a.node_uid ?? "",
             rx_rate_kbps: a.rx_rate_kbps ?? null,
@@ -388,7 +387,7 @@ class FritzMeshCard extends HTMLElement {
         } else {
           const slave = {
             name: a.node_name,
-            is_master: false,
+            node_type: "slave",
             node_uid: a.node_uid ?? "",
             rx_rate_kbps: a.rx_rate_kbps ?? null,
             tx_rate_kbps: a.tx_rate_kbps ?? null,
@@ -821,7 +820,7 @@ ve
   }
 
   _isNodeOnline(node) {
-    if (!node || node.is_master) return true;
+    if (!node || node.node_type === "master") return true;
     // Without uplink state data, assume online (slave is registered in HA).
     return true;
   }
@@ -1037,7 +1036,7 @@ class FritzMeshCardEditor extends HTMLElement {
             `).join("")}
           </select>
           <div class="hint">
-            Only fritz integration master node sensors are shown (those with <code>is_master: true</code>).
+            Only fritz integration master node sensors are shown (those with <code>node_type: master</code>).
           </div>
         </div>
 
@@ -1252,7 +1251,7 @@ class FritzMeshCardEditor extends HTMLElement {
 
   /**
    * Filter entity picker to master mesh node sensors from the fritz integration.
-   * These carry is_master === true and fritz_unique_id in their attributes.
+   * These carry node_type === "master" and fritz_unique_id in their attributes.
    */
   _isApplicableEntity(entityId) {
     if (!entityId || !entityId.startsWith("sensor.")) return false;
@@ -1260,11 +1259,8 @@ class FritzMeshCardEditor extends HTMLElement {
     const state = this._hass?.states?.[entityId];
     const attrs = state?.attributes ?? {};
 
-    // Primary signal: sensor has is_master flag from the fritz integration.
-    if (attrs.is_master === true) return true;
-
-    // Fallback for early startup when state may not yet be loaded.
-    return Boolean(attrs.fritz_unique_id) && attrs.is_master !== false;
+    // Primary signal: sensor has node_type "master" flag from the fritz integration.
+    if (attrs.node_type === "master") return true;
   }
 
   _applicableEntities() {
