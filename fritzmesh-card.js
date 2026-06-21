@@ -15,15 +15,17 @@
  *
  * Card YAML configuration:
  *   type: custom:fritzmesh-card
- *   entity: sensor.fritz_box_mesh_connected_devices   # required – master node sensor
+ *   device_name: FRITZ!Box 7530           # required – fritz device name
+ *   update_interval: 60                   # optional; refresh every 60 seconds
  *   title: Fritz!Box Mesh               # optional; omit to use default title,
  *                                       # set to "" to hide the header entirely
  *   hide_offline_nodes: true            # optional; hide disconnected clients
  *
  * Data flow:
  *   Home Assistant state machine
- *     → set hass()          (called on every HA state update)
- *       → _render()         (only if relevant entity attributes changed)
+ *     → set hass()          (stores latest HA state object)
+ *   Periodic refresh loop
+ *     → _render()         (triggered on an interval, using hass.states data)
  *         → _masterPanel()  (left sticky panel: router icon + device info)
  *         → _masterSection() (direct clients of the master)
  *         → _slaveSection()  (one section per repeater + its clients)
@@ -132,7 +134,7 @@ class FritzMeshCard extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._config  = null;
     this._hass    = null;
-    this._lastKey = "";
+    this._refreshTimer = null;
     this._sizeMode = "";
     this._resizeObserver = null;
     // Track rendered node/client counts for getCardSize().
@@ -141,7 +143,7 @@ class FritzMeshCard extends HTMLElement {
   }
 
   static getStubConfig() {
-    return { entity: "sensor.fritz_box_mesh_connected_devices" };
+    return { device_name: "FRITZ!Box 7530" };
   }
 
   static getConfigElement() {
@@ -167,6 +169,7 @@ class FritzMeshCard extends HTMLElement {
     };
     this.addEventListener("wheel", this._wheelHandler, { passive: false });
     this._startSyncLoop();
+    this._startRefreshLoop();
   }
 
   disconnectedCallback() {
@@ -179,6 +182,7 @@ class FritzMeshCard extends HTMLElement {
       this._wheelHandler = null;
     }
     this._stopSyncLoop();
+    this._stopRefreshLoop();
   }
 
   _startSyncLoop() {
@@ -213,53 +217,78 @@ class FritzMeshCard extends HTMLElement {
     this._syncLoopActive = false;
   }
 
-  setConfig(config) {
-    if (!config?.entity) {
-      const msg = `fritzmesh-card: \`entity\` is missing or empty. ` +
-        `Received config: ${JSON.stringify(config)}`;
-      console.error(msg);
-      throw new Error(msg);
-    }
-    const nodeSort = config.node_sort ?? "default";
-    if (!["default", "name", "ip", "mac"].includes(nodeSort)) {
-      throw new Error("fritzmesh-card: node_sort must be 'default', 'name', 'ip', or 'mac'");
-    }
-    const transferMetricMode = config.transfer_metric_mode ?? "none";
-    if (!["none", "aggregate", "max_single", "average"].includes(transferMetricMode)) {
-      throw new Error(
-        "fritzmesh-card: transfer_metric_mode must be 'none', 'aggregate', 'max_single', or 'average'"
-      );
-    }
-    const hideOfflineNodes = config.hide_offline_nodes === true;
-    this._config = {
-      ...config,
-      url_template: config.url_template ?? "http://{ip}",
-      node_sort: nodeSort,
-      transfer_metric_mode: transferMetricMode,
-      hide_offline_nodes: hideOfflineNodes,
-      line_color: sanitizeHexColor(config.line_color, "#4caf50"),
-      accent_color: sanitizeHexColor(config.accent_color, "#1976d2"),
-      text_dim_color: sanitizeHexColor(config.text_dim_color, "#888888"),
-      master_panel_start_color: sanitizeHexColor(config.master_panel_start_color, "#1565c0"),
-      master_panel_end_color: sanitizeHexColor(config.master_panel_end_color, "#1e88e5"),
-      font_scale: sanitizeFontScale(config.font_scale, 100),
-    };
+  _startRefreshLoop() {
+    this._stopRefreshLoop();
 
-    this._lastKey = "";
-    if (this._hass) this._render();
+    const interval = Number(this._config?.update_interval ?? 60);
+    const refreshInterval = Number.isFinite(interval) && interval > 0 ? Math.max(1, Math.round(interval)) : 60;
+
+    this._queryFritzMeshDataAndRender();
+
+    this._refreshTimer = window.setInterval(() => {
+      this._queryFritzMeshDataAndRender();
+    }, refreshInterval * 1000);
   }
 
-  /**
-   * Build a cache key from all entities that affect the rendered topology:
-   *   • the configured master sensor
-   *   • all sensors with the same fritz_unique_id (slave nodes)
-   *   • all device_tracker entities that carry a connected_to attribute
-   */
-  set hass(hass) {
-    if (!this._config) return;
-    this._hass = hass;
+  _stopRefreshLoop() {
+    if (this._refreshTimer !== null) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+  }
 
-    const masterState = hass?.states?.[this._config.entity];
+  _restartRefreshLoop() {
+    if (!this.isConnected) return;
+    this._startRefreshLoop();
+  }
+
+  _getConfiguredDeviceConfigEntryId() {
+    if (!this._config?.device_name || !this._hass?.devices) return null;
+
+    const device = Object.values(this._hass.devices).find((device) => {
+      const name = String(device.name || "").trim();
+      const nameByUser = String(device.name_by_user || "").trim();
+      return name === this._config.device_name || nameByUser === this._config.device_name;
+    });
+
+    return device?.config_entries?.[0] ?? null;
+  }
+
+  _queryFritzMeshDataAndRender() {
+    if (!this._config || !this._hass) return;
+
+    const configEntryId = this._getConfiguredDeviceConfigEntryId();
+    if (!configEntryId) {
+      console.warn(
+        `fritzmesh-card: could not resolve config_entry_id for device ${this._config.device_name}`
+      );
+      return;
+    }
+
+    try {
+      // Wichtig sind die zusätzlichen Parameter am Ende (..., target, returnResponse)
+      this._hass.callService(
+        'fritz',          // Domain
+        'get_mesh_info',    // Service / Action
+        { config_entry_id: configEntryId },  // Service Data (Felder)
+        {}, // Target (Zielgerät)
+        true,               // Optionaler interner Flag
+        true                // returnResponse: ZWINGEND ERFORDERLICH für Antwortdaten!
+      ).then(result => {
+        if (result && result.response) {
+          this._renderIfChanged(result.response?.hosts_attributes, result.response?.mesh_topology);
+        }
+      })
+      .catch(error => {
+            console.error("Fehler aufgetreten:", error);
+      });
+    } catch (error) {
+      console.error("Fehler beim Service-Aufruf:", error);
+    }
+  }
+
+  _renderIfChanged(hostAttributes, meshTopology) {
+    const masterState = this._hass?.states?.[this._config.entity];
     const fritzUid = masterState?.attributes?.fritz_unique_id;
 
     const keyParts = { master: masterState?.attributes, masterState: masterState?.state };
@@ -268,7 +297,7 @@ class FritzMeshCard extends HTMLElement {
       const slaveAttrs = {};
       const switchAttrs = {};
       const trackerStates = {};
-      for (const [eid, s] of Object.entries(hass.states)) {
+      for (const [eid, s] of Object.entries(this._hass.states)) {
         const a = s?.attributes ?? {};
         if (eid.startsWith("sensor.") && a.fritz_unique_id === fritzUid && a.node_type !== "master") {
           if (a.node_type === "switch") {
@@ -295,6 +324,67 @@ class FritzMeshCard extends HTMLElement {
       console.error("fritzmesh-card render error:", e);
       this._setHTML("", `<div class="msg warn">${ICON.unknown}<span>Render error: <code>${esc(String(e))}</code></span></div>`);
     }
+  }
+
+  setConfig(config) {
+    if (!config?.device_name) {
+      const msg = `fritzmesh-card: \`device_name\` is missing or empty. ` +
+        `Received config: ${JSON.stringify(config)}`;
+      console.error(msg);
+      throw new Error(msg);
+    }
+    const nodeSort = config.node_sort ?? "default";
+    if (!["default", "name", "ip", "mac"].includes(nodeSort)) {
+      throw new Error("fritzmesh-card: node_sort must be 'default', 'name', 'ip', or 'mac'");
+    }
+    const transferMetricMode = config.transfer_metric_mode ?? "none";
+    if (!["none", "aggregate", "max_single", "average"].includes(transferMetricMode)) {
+      throw new Error(
+        "fritzmesh-card: transfer_metric_mode must be 'none', 'aggregate', 'max_single', or 'average'"
+      );
+    }
+    const hideOfflineNodes = config.hide_offline_nodes === true;
+    const interval = Number(config.update_interval ?? 60);
+    const updateInterval = Number.isFinite(interval) && interval > 0 ? Math.max(1, Math.round(interval)) : 60;
+
+    // TODO: Replace hard-coded entity with dynamic lookup (device_name -> device ID -> entity)
+    // For now, hard-code the connected_devices entity while refactoring device selection
+    const entity = "sensor.fritz_box_7530_connected_devices";
+
+    this._config = {
+      ...config,
+      entity: entity,
+      update_interval: updateInterval,
+      url_template: config.url_template ?? "http://{ip}",
+      node_sort: nodeSort,
+      transfer_metric_mode: transferMetricMode,
+      hide_offline_nodes: hideOfflineNodes,
+      line_color: sanitizeHexColor(config.line_color, "#4caf50"),
+      accent_color: sanitizeHexColor(config.accent_color, "#1976d2"),
+      text_dim_color: sanitizeHexColor(config.text_dim_color, "#888888"),
+      master_panel_start_color: sanitizeHexColor(config.master_panel_start_color, "#1565c0"),
+      master_panel_end_color: sanitizeHexColor(config.master_panel_end_color, "#1e88e5"),
+      font_scale: sanitizeFontScale(config.font_scale, 100),
+    };
+
+    if (this.isConnected) {
+      this._restartRefreshLoop();
+    }
+
+    if (this._hass) {
+      this._queryFritzMeshDataAndRender();
+    }
+  }
+
+  /**
+   * Build a cache key from all entities that affect the rendered topology:
+   *   • the configured master sensor
+   *   • all sensors with the same fritz_unique_id (slave nodes)
+   *   • all device_tracker entities that carry a connected_to attribute
+   */
+  set hass(hass) {
+    if (!this._config) return;
+    this._hass = hass;
   }
 
   getCardSize() {
@@ -645,7 +735,9 @@ ve
     const isFullContent = treeHtml !== undefined;
 
     const haCard = sr.querySelector("ha-card");
-    if (!haCard) {
+    const cardBody = haCard?.querySelector(".card-body");
+    const isFirstRender = !haCard || !cardBody;
+    if (isFirstRender) {
       // ── First render: build the full skeleton ──
       const bodyHtml = isFullContent
         ? `<div class="master-col">${masterHtml}</div><div class="tree">${treeHtml}</div>`
@@ -677,7 +769,6 @@ ve
       hdr.textContent = title;
     }
 
-    const cardBody = sr.querySelector(".card-body");
     if (!isFullContent) {
       // Error / warning path: replace entire card-body
       cardBody.innerHTML = masterHtml;
@@ -968,9 +1059,10 @@ class FritzMeshCardEditor extends HTMLElement {
   }
 
   _render() {
-    const entities = this._applicableEntities();
-    const currentEntity = this._config.entity ?? "";
+    const devices = this._applicableDevices();
+    const currentDeviceName = this._config.device_name ?? "";
     const currentTitle = this._config.title ?? "";
+    const currentUpdateInterval = this._config.update_interval ?? 60;
     const currentUrlTemplate = this._config.url_template ?? "http://{ip}";
     const currentNodeSort = this._config.node_sort ?? "default";
     const currentTransferMetricMode = this._config.transfer_metric_mode ?? "none";
@@ -1026,28 +1118,30 @@ class FritzMeshCardEditor extends HTMLElement {
       </style>
       <div class="card-config">
         <div>
-          <label for="entity-select">Master node sensor (required)</label>
-          <select id="entity-select">
-            <option value="">Select an entity...</option>
-            ${entities.map((entityId) => `
-              <option value="${esc(entityId)}" ${entityId === currentEntity ? "selected" : ""}>
-                ${esc(entityId)}
+          <label for="device-select">Fritz device (required)</label>
+          <select id="device-select">
+            <option value="">Select a device...</option>
+            ${devices.map((deviceName) => `
+              <option value="${esc(deviceName)}" ${deviceName === currentDeviceName ? "selected" : ""}>
+                ${esc(deviceName)}
               </option>
             `).join("")}
           </select>
           <div class="hint">
-            Only fritz integration master node sensors are shown (those with <code>node_type: master</code>).
+            Only devices from the fritz integration are shown.
           </div>
         </div>
 
         <div>
-          <label for="entity-input">Or enter entity id manually</label>
+          <label for="update-interval">Update interval (seconds)</label>
           <input
-            id="entity-input"
-            type="text"
-            placeholder="sensor.fritz_box_mesh_connected_devices"
-            value="${esc(currentEntity)}"
+            id="update-interval"
+            type="number"
+            min="1"
+            step="1"
+            value="${esc(String(currentUpdateInterval))}"
           />
+          <div class="hint">How often the card refreshes from the fritz entities. Default is 60 seconds.</div>
         </div>
 
         <div>
@@ -1138,9 +1232,9 @@ class FritzMeshCardEditor extends HTMLElement {
         </div>
       </div>`;
 
-    const entitySelect = this.shadowRoot.querySelector("#entity-select");
-    const entityInput = this.shadowRoot.querySelector("#entity-input");
+    const deviceSelect = this.shadowRoot.querySelector("#device-select");
     const titleInput = this.shadowRoot.querySelector("#title-input");
+    const updateIntervalInput = this.shadowRoot.querySelector("#update-interval");
     const nodeSortInput = this.shadowRoot.querySelector("#node-sort");
     const transferMetricModeInput = this.shadowRoot.querySelector("#transfer-metric-mode");
     const hideOfflineNodesInput = this.shadowRoot.querySelector("#hide-offline-nodes");
@@ -1152,19 +1246,19 @@ class FritzMeshCardEditor extends HTMLElement {
     const masterPanelStartColorInput = this.shadowRoot.querySelector("#master-panel-start-color");
     const masterPanelEndColorInput = this.shadowRoot.querySelector("#master-panel-end-color");
 
-    entitySelect?.addEventListener("change", (e) => {
+    deviceSelect?.addEventListener("change", (e) => {
       const val = e.target.value;
       const cfg = { ...this._config };
-      if (val) cfg.entity = val;
+      if (val) cfg.device_name = val;
+      else delete cfg.device_name;
       this._dispatch(cfg);
-      if (entityInput) entityInput.value = val;
     });
 
-    entityInput?.addEventListener("change", (e) => {
-      const val = e.target.value?.trim();
+    updateIntervalInput?.addEventListener("change", (e) => {
+      const val = Number(e.target.value);
       const cfg = { ...this._config };
-      if (val) cfg.entity = val;
-      else delete cfg.entity;
+      if (Number.isFinite(val) && val > 0) cfg.update_interval = Math.round(val);
+      else delete cfg.update_interval;
       this._dispatch(cfg);
     });
 
@@ -1253,21 +1347,21 @@ class FritzMeshCardEditor extends HTMLElement {
    * Filter entity picker to master mesh node sensors from the fritz integration.
    * These carry node_type === "master" and fritz_unique_id in their attributes.
    */
-  _isApplicableEntity(entityId) {
-    if (!entityId || !entityId.startsWith("sensor.")) return false;
+  _applicableDevices() {
+    if (!this._hass?.devices) return [];
 
-    const state = this._hass?.states?.[entityId];
-    const attrs = state?.attributes ?? {};
-
-    // Primary signal: sensor has node_type "master" flag from the fritz integration.
-    if (attrs.node_type === "master") return true;
-  }
-
-  _applicableEntities() {
-    if (!this._hass?.states) return [];
-    return Object.keys(this._hass.states)
-      .filter((entityId) => this._isApplicableEntity(entityId))
+    // Filter devices that are from the fritz integration
+    // Fritz devices have 'fritz' as the first element in their identifiers array
+    const fritzDevices = Object.values(this._hass.devices)
+      .filter((device) => {
+        // Check if device has identifiers and the first identifier starts with 'fritz'
+        const identifiers = device.identifiers?.[0];
+        return identifiers?.[0] === "fritz";
+      })
+      .map((device) => device.name)
       .sort((a, b) => a.localeCompare(b));
+
+    return fritzDevices;
   }
 }
 
