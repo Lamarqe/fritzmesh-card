@@ -1,5 +1,5 @@
 /**
- * Fritz!Box Mesh Topology Card  –  v2.2.0
+ * Fritz!Box Mesh Topology Card  –  v3.0
  *
  * A custom Lovelace card that visualises the Fritz!Box mesh network as a
  * hierarchical tree diagram.  Data is read directly from the standard
@@ -20,20 +20,10 @@
  *   title: Fritz!Box Mesh               # optional; omit to use default title,
  *                                       # set to "" to hide the header entirely
  *   hide_offline_nodes: true            # optional; hide disconnected clients
- *
- * Data flow:
- *   Home Assistant state machine
- *     → set hass()          (stores latest HA state object)
- *   Periodic refresh loop
- *     → _render()         (triggered on an interval, using hass.states data)
- *         → _masterPanel()  (left sticky panel: router icon + device info)
- *         → _masterSection() (direct clients of the master)
- *         → _slaveSection()  (one section per repeater + its clients)
- *         → _switchSection() (one section per LAN switch + its clients)
- *         → _clientRow()     (individual device rows with speed/band label)
  */
 
-const CARD_VERSION = "4.0.0";
+const CARD_VERSION = "5.0.0";
+
 
 console.info("[fritzmesh-card] script executing, version", CARD_VERSION,
   "| already defined:", !!customElements.get("fritzmesh-card"));
@@ -65,6 +55,7 @@ const esc = (s) =>
     .replace(/"/g, "&quot;");
 
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{6})$/;
+const SWITCH_DEVICE_CLASS = "NETWORK_SWITCH";
 
 function sanitizeHexColor(value, fallback) {
   const v = String(value ?? "").trim();
@@ -91,6 +82,7 @@ function sanitizeFontScale(value, fallback = 100) {
  * @param {number|null|undefined} kbps - Speed in kbit/s.
  * @returns {string|null} Formatted string, or null if the value is falsy/zero.
  */
+
 function fmtSpeed(kbps) {
   if (!kbps || kbps <= 0) return null;
   if (kbps >= 1_000_000) return `${(kbps / 1_000_000).toFixed(1)} Gbit/s`;
@@ -288,40 +280,337 @@ class FritzMeshCard extends HTMLElement {
   }
 
   _renderIfChanged(hostAttributes, meshTopology) {
-    const masterState = this._hass?.states?.[this._config.entity];
-    const fritzUid = masterState?.attributes?.fritz_unique_id;
+    // Build an in-memory mesh model from the service-provided data.
+    // Normalize hosts by MAC for quick lookup.
+    try {
+      if (!meshTopology || !hostAttributes) {
+        console.warn("fritzmesh-card: missing meshTopology or hostAttributes");
+        return;
+      }
 
-    const keyParts = { master: masterState?.attributes, masterState: masterState?.state };
+      const normMac = (mac) => String(mac || "").toLowerCase().replace(/[^0-9a-f]/g, "").match(/.{1,2}/g)?.join(":") || null;
 
-    if (fritzUid) {
-      const slaveAttrs = {};
-      const switchAttrs = {};
-      const trackerStates = {};
-      for (const [eid, s] of Object.entries(this._hass.states)) {
-        const a = s?.attributes ?? {};
-        if (eid.startsWith("sensor.") && a.fritz_unique_id === fritzUid && a.node_type !== "master") {
-          if (a.node_type === "switch") {
-            switchAttrs[eid] = a;
-          } else {
-            slaveAttrs[eid] = a;
+      const hostsByMac = {};
+      // hostAttributes may be an array or an object; handle both.
+      const hostEntries = Array.isArray(hostAttributes) ? hostAttributes : Object.values(hostAttributes || {});
+      for (const h of hostEntries) {
+        const macRaw = h?.MACAddress || h?.MAC || h?.mac || h?.X_AVM_DE_MACAddress || h?.X_AVM_DE_MACAddressList;
+        const mac = normMac(macRaw || h?.MACAddress || h?.MACAddressList || h?.X_AVM_DE_MACAddress);
+        if (!mac) continue;
+        hostsByMac[mac] = {
+          raw: h,
+          ip: h?.IPAddress || h?.ip || null,
+          name: h?.X_AVM_DE_FriendlyName || h?.HostName || h?.Host || h?.Name || null,
+          active: h?.Active === true || h?.Active === "1" || !!h?.Active,
+          wan_access: h?.X_AVM_DE_WANAccess || null,
+        };
+      }
+
+      // Build mesh interface index and uplink map.
+      const meshIntf = {}; // uid -> { device, mac, type, op_mode, ssid, band }
+      const uplinkByChild = {}; // child_uid -> { parentUid, link }
+
+      const nodes = Array.isArray(meshTopology.nodes) ? meshTopology.nodes : (meshTopology?.nodes || []);
+      for (const node of nodes) {
+        if (!node?.is_meshed) continue;
+        const devName = node?.device_name || node?.deviceModel || node?.device_model || "";
+        for (const intf of node?.node_interfaces || []) {
+          const uid = intf?.uid || intf?.id || null;
+          if (!uid) continue;
+          const mac = normMac(intf?.mac_address || intf?.mac || intf?.macAddress);
+          const type = intf?.type || (String(intf?.name || "").toUpperCase().includes("LAN") ? "LAN" : "WLAN");
+          const op_mode = intf?.op_mode || intf?.mode || "";
+          const ssid = intf?.ssid || null;
+          const band = (function (n) {
+            if (!n) return "";
+            const s = String(n).toUpperCase();
+            if (s.includes("6G") || s.includes("6 GHZ") || s.includes("6GHZ")) return "6 GHz";
+            if (s.includes("5G")) return "5 GHz";
+            if (s.includes("2G") || s.includes("2.4")) return "2.4 GHz";
+            return "";
+          })(intf?.name || "");
+          meshIntf[uid] = { device: devName, mac, type, op_mode, ssid, band };
+
+          for (const link of intf?.node_links || []) {
+            if (link?.state !== "CONNECTED") continue;
+            const childUid = link?.node_interface_2_uid || null;
+            const parentUid = link?.node_interface_1_uid || null;
+            if (childUid && parentUid) {
+              uplinkByChild[childUid] = { parentUid, link };
+            }
           }
-        } else if (eid.startsWith("device_tracker.") && a.connected_to) {
-          trackerStates[eid] = { state: s.state, attributes: a };
         }
       }
-      keyParts.slaves = slaveAttrs;
-      keyParts.switches = switchAttrs;
-      keyParts.trackers = trackerStates;
-    }
 
-    const key = JSON.stringify(keyParts);
-    if (key === this._lastKey) return;
-    this._lastKey = key;
+      // Helper to find a slave's uplink: try direct child->parent then fall back to switch-link reverse lookup.
+      const findSlaveUplink = (node) => {
+        for (const intf of node?.node_interfaces || []) {
+          const uid = intf?.uid;
+          const entry = uplinkByChild[uid];
+          if (entry) {
+            const parentIntf = meshIntf[entry.parentUid];
+            if (parentIntf) return { parentIntf, link: entry.link };
+          }
+        }
+        // Prefer explicit upstream interfaces (common for LAN-backhaul repeaters).
+        for (const intf of node?.node_interfaces || []) {
+          if (intf?.is_upstream !== true) continue;
+          for (const link of intf?.node_links || []) {
+            if (link?.state !== "CONNECTED") continue;
+            const parentIntf = meshIntf[link?.node_interface_2_uid];
+            if (parentIntf) return { parentIntf, link };
+          }
+        }
+        // Fallback for LAN-backhaul slaves: upstream interface is node_interface_2_uid.
+        for (const intf of node?.node_interfaces || []) {
+          for (const link of intf?.node_links || []) {
+            if (link?.state !== "CONNECTED") continue;
+            const parentIntf = meshIntf[link?.node_interface_2_uid];
+            if (parentIntf) return { parentIntf, link };
+          }
+        }
+        return { parentIntf: null, link: null };
+      };
 
-    try {
+      // In-memory switch registration (stable key generation)
+      const cryptoDigest8 = (macs) => {
+        try {
+          const s = (macs || []).filter(Boolean).sort().join(",");
+          // Use a lightweight hash fallback (not cryptographic): djb2 over string, converted to hex
+          let h = 5381;
+          for (let i = 0; i < s.length; i++) h = ((h << 5) + h) + s.charCodeAt(i);
+          return ("00000000" + (h >>> 0).toString(16)).slice(-8);
+        } catch (e) {
+          return "00000000";
+        }
+      };
+
+      const switchNodes = [];
+      const nodesByName = {};
+      const slaveNodes = [];
+      let masterNode = null;
+
+      // First create node skeletons
+      for (const node of nodes) {
+        const isMeshed = !!node?.is_meshed;
+        const role = node?.mesh_role || (isMeshed ? "slave" : "unknown");
+        const name = node?.device_name || node?.device_model || "";
+        const nodeMac = normMac(node?.device_mac_address || node?.device_mac || node?.device_mac_address_raw);
+
+        if (role === "master") {
+          const host = hostsByMac[nodeMac];
+          masterNode = {
+            name: name || "Fritz!Box",
+            node_type: "master",
+            node_uid: nodeMac || "",
+            host: host?.ip || "",
+            rx_rate_kbps: null,
+            tx_rate_kbps: null,
+            clients: [],
+          };
+          nodesByName[masterNode.name] = masterNode;
+          continue;
+        }
+
+        // Keep switch detection strict, same as HA core: only device_class NETWORK_SWITCH.
+        const isSwitchNode = !isMeshed && node?.device_class === SWITCH_DEVICE_CLASS;
+        if (isSwitchNode) {
+          const macs = (node?.node_interfaces || []).map((i) => normMac(i?.mac_address));
+          if (nodeMac) macs.push(nodeMac);
+          const key = `switch_${cryptoDigest8(macs)}`;
+          const host = hostsByMac[normMac(nodeMac)];
+          const friendly = host?.name || name || key;
+
+          // Detect switch uplink speed before re-registering switch interfaces,
+          // so only already-indexed meshed interfaces are considered as uplink parent.
+          let uplinkRx = null;
+          let uplinkTx = null;
+          for (const intf of node?.node_interfaces || []) {
+            for (const link of intf?.node_links || []) {
+              if (link?.state !== "CONNECTED") continue;
+              if (!meshIntf[link?.node_interface_1_uid]) continue;
+              uplinkRx = link?.cur_data_rate_rx ?? null;
+              uplinkTx = link?.cur_data_rate_tx ?? null;
+              break;
+            }
+            if (uplinkRx && uplinkRx > 0) break;
+          }
+
+          const sw = {
+            name: friendly,
+            node_type: "switch",
+            node_uid: key,
+            rx_rate_kbps: uplinkRx,
+            tx_rate_kbps: uplinkTx,
+            clients: [],
+            slaveChildren: []
+          };
+
+          // Mirror HA core behavior: register switch interfaces under switch_key
+          // and extend uplink map with switch links.
+          for (const intf of node?.node_interfaces || []) {
+            const uid = intf?.uid || intf?.id || null;
+            if (!uid) continue;
+            const mac = normMac(intf?.mac_address || intf?.mac || intf?.macAddress);
+            const type = intf?.type || (String(intf?.name || "").toUpperCase().includes("LAN") ? "LAN" : "WLAN");
+            const op_mode = intf?.op_mode || intf?.mode || "";
+            const ssid = intf?.ssid || null;
+            meshIntf[uid] = { device: key, mac, type, op_mode, ssid, band: "" };
+
+            for (const link of intf?.node_links || []) {
+              if (link?.state !== "CONNECTED") continue;
+              const childUid = link?.node_interface_2_uid || null;
+              const parentUid = link?.node_interface_1_uid || null;
+              if (childUid && parentUid) {
+                uplinkByChild[childUid] = { parentUid, link };
+              }
+            }
+          }
+
+          switchNodes.push(sw);
+          nodesByName[key] = sw;
+          if (friendly) nodesByName[friendly] = sw;
+          continue;
+        }
+
+        // Non-meshed non-switch nodes are regular clients, not topology nodes.
+        if (!isMeshed) continue;
+
+        // Meshed non-master nodes are slave candidates.
+        const slave = { name: name || "", node_type: "slave", node_uid: nodeMac || "", rx_rate_kbps: null, tx_rate_kbps: null, parent_link_type: "LAN", parent_node: node?.parent_node ?? null, clients: [] };
+        slaveNodes.push(slave);
+        nodesByName[slave.name || slave.node_uid] = slave;
+      }
+
+      // Enrich hosts from topology for both meshed and non-meshed nodes.
+      for (const node of nodes) {
+        if (node?.mesh_role === "master") continue;
+        const isSwitchNode = !node?.is_meshed && node?.device_class === SWITCH_DEVICE_CLASS;
+        if (isSwitchNode) continue;
+        const nodeMac = normMac(node?.device_mac_address || node?.device_mac);
+
+        if (node?.is_meshed) {
+          const host = hostsByMac[nodeMac];
+          const uplink = findSlaveUplink(node);
+          const parent = uplink.parentIntf;
+          const link = uplink.link;
+
+          const slaveNode = nodesByName[node?.device_name] || nodesByName[nodeMac];
+          if (parent) {
+            if (host) {
+              host.connected_to = parent.device;
+              host.connection_type = parent.type || "LAN";
+              host.ssid = parent.ssid || null;
+              host.wifi_band = parent.band || null;
+              host.cur_rx_rate = link?.cur_data_rate_rx ?? null;
+              host.cur_tx_rate = link?.cur_data_rate_tx ?? null;
+            }
+
+            if (slaveNode && slaveNode.node_type === "slave") {
+              slaveNode.parent_node = parent.device || null;
+              slaveNode.parent_link_type = parent.type || "LAN";
+              slaveNode.rx_rate_kbps = link?.cur_data_rate_rx ?? null;
+              slaveNode.tx_rate_kbps = link?.cur_data_rate_tx ?? null;
+            }
+          }
+          continue;
+        }
+
+        const host = hostsByMac[nodeMac];
+        if (!host) continue;
+
+        // Non-meshed clients should also be connected to a parent interface.
+        for (const intf of node?.node_interfaces || []) {
+          for (const link of intf?.node_links || []) {
+            if (link?.state !== "CONNECTED") continue;
+            const parentUid = link?.node_interface_1_uid === intf?.uid
+              ? link?.node_interface_2_uid
+              : link?.node_interface_1_uid;
+            const parent = meshIntf[parentUid];
+            if (!parent) continue;
+            host.connected_to = parent.device;
+            host.connection_type = parent.type || "LAN";
+            host.ssid = parent.ssid || null;
+            host.wifi_band = parent.band || null;
+            host.cur_rx_rate = link?.cur_data_rate_rx ?? null;
+            host.cur_tx_rate = link?.cur_data_rate_tx ?? null;
+            break;
+          }
+          if (host.connected_to) break;
+        }
+      }
+
+      // Build a map of device_tracker entities by MAC for more-info mapping.
+      const deviceTrackerByMac = {};
+      for (const [eid, s] of Object.entries(this._hass?.states || {})) {
+        if (!eid.startsWith("device_tracker.")) continue;
+        const a = s?.attributes ?? {};
+        const dmac = normMac(a.mac || a.mac_address || a.macAddress || a.MACAddress || a.MAC);
+        if (dmac) deviceTrackerByMac[dmac] = eid;
+      }
+
+      // Populate clients from hostsByMac
+      for (const [mac, h] of Object.entries(hostsByMac)) {
+        if (!h.connected_to) continue;
+        const hostDeviceClass = String(h?.raw?.["X_AVM-DE_DeviceClass"] || "").toUpperCase();
+        if (hostDeviceClass === "NETWORKSWITCH") continue;
+        const node = nodesByName[h.connected_to] || nodesByName[h.connected_to?.toString()];
+        const client = {
+          name: h.name || h.raw?.HostName || h.raw?.Host || mac,
+          mac,
+          ip: h.ip || "",
+          connection_type: h.connection_type || null,
+          ssid: h.ssid || null,
+          wifi_band: h.wifi_band || null,
+          node_name: h.raw?.node_name || null,
+          connection_state: h.active ? "CONNECTED" : "DISCONNECTED",
+          cur_rx_kbps: h.cur_rx_rate ?? null,
+          cur_tx_kbps: h.cur_tx_rate ?? null,
+          ha_entity_id: deviceTrackerByMac[mac] || "",
+        };
+        if (node) {
+          node.clients = node.clients || [];
+          node.clients.push(client);
+        }
+      }
+
+      // Attach slave children to switches when applicable
+      const switchKeys = new Set(switchNodes.map((s) => s.node_uid));
+      for (const s of slaveNodes) {
+        if (s.parent_node && switchKeys.has(s.parent_node)) {
+          const parent = nodesByName[s.parent_node];
+          parent.slaveChildren = parent.slaveChildren || [];
+          parent.slaveChildren.push(s);
+          s._renderedUnderSwitch = true;
+        }
+      }
+
+      // If no master found in topology, attempt to derive from first meshed node host
+      if (!masterNode) {
+        const firstMeshed = nodes.find((n) => n?.is_meshed);
+        if (firstMeshed) {
+          const mMac = normMac(firstMeshed?.device_mac_address || firstMeshed?.device_mac);
+          const mh = hostsByMac[mMac];
+          masterNode = { name: firstMeshed?.device_name || (mh?.name || "Fritz!Box"), node_type: "master", node_uid: mMac || "", host: mh?.ip || "", rx_rate_kbps: null, tx_rate_kbps: null, clients: [] };
+          nodesByName[masterNode.name] = masterNode;
+        }
+      }
+
+      // Save computed model for _render() to use
+      this._computedModel = { masterNode, slaveNodes, switchNodes, nodesByName };
+
+      // Build cache key similar to previous approach
+      const keyParts = { master: masterNode, slaves: {}, switches: {}, trackers: {} };
+      for (const s of slaveNodes) keyParts.slaves[s.node_uid || s.name] = { name: s.name, parent: s.parent_node };
+      for (const sw of switchNodes) keyParts.switches[sw.node_uid] = { name: sw.name };
+
+      const key = JSON.stringify(keyParts);
+      if (key === this._lastKey) return;
+      this._lastKey = key;
+
       this._render();
     } catch (e) {
-      console.error("fritzmesh-card render error:", e);
+      console.error("fritzmesh-card render error (model build):", e);
       this._setHTML("", `<div class="msg warn">${ICON.unknown}<span>Render error: <code>${esc(String(e))}</code></span></div>`);
     }
   }
@@ -347,13 +636,14 @@ class FritzMeshCard extends HTMLElement {
     const interval = Number(config.update_interval ?? 60);
     const updateInterval = Number.isFinite(interval) && interval > 0 ? Math.max(1, Math.round(interval)) : 60;
 
-    // TODO: Replace hard-coded entity with dynamic lookup (device_name -> device ID -> entity)
-    // For now, hard-code the connected_devices entity while refactoring device selection
-    const entity = "sensor.fritz_box_7530_connected_devices";
+    // Do not hard-code a connected_devices entity. If the user provided an explicit
+    // `entity` in the config, keep it for backward compatibility; otherwise leave
+    // it unset and prefer mesh service data as the primary data source.
+    const entity = config.entity ?? undefined;
 
     this._config = {
       ...config,
-      entity: entity,
+      ...(entity ? { entity } : {}),
       update_interval: updateInterval,
       url_template: config.url_template ?? "http://{ip}",
       node_sort: nodeSort,
@@ -377,10 +667,9 @@ class FritzMeshCard extends HTMLElement {
   }
 
   /**
-   * Build a cache key from all entities that affect the rendered topology:
-   *   • the configured master sensor
-   *   • all sensors with the same fritz_unique_id (slave nodes)
-   *   • all device_tracker entities that carry a connected_to attribute
+   * Home Assistant state setter.
+   * Rendering data is fetched via fritz.get_mesh_info and then mapped into
+   * _computedModel by _renderIfChanged().
    */
   set hass(hass) {
     if (!this._config) return;
@@ -405,150 +694,34 @@ class FritzMeshCard extends HTMLElement {
   // ── Render ────────────────────────────────────────────────────────────────
 
   /**
-   * Main render method: build topology from fritz integration entities.
-   *
-   * 1. Read master node attrs from the configured sensor entity.
-   * 2. Discover slave nodes: sensors with matching fritz_unique_id and node_type!=master.
-   * 3. Assign clients: device_tracker entities whose connected_to matches a node name.
-   * 4. Determine slave uplink type from the slave's device_tracker (if found).
+   * Main render method: consume the in-memory topology model built from
+   * hostAttributes + meshTopology in _renderIfChanged().
    */
   _render() {
     const title = this._config.title ?? "";
-
-    const state = this._hass?.states?.[this._config.entity];
-
-    if (!state || state.state === "unavailable") {
-      this._setHTML(title, `
-        <div class="msg warn">
-          ${ICON.unknown}
-          Entity <code>${esc(this._config.entity)}</code> is unavailable.
-        </div>`);
+    const model = this._computedModel;
+    if (!model?.masterNode) {
+      this._setHTML(
+        title,
+        '<div class="msg">No topology data yet — waiting for first coordinator update.</div>'
+      );
       return;
     }
 
-    const masterAttrs = state.attributes ?? {};
-    const fritzUid  = masterAttrs.fritz_unique_id;
-    const fritzHost = masterAttrs.fritz_host ?? "";
+    const masterNode = model.masterNode;
+    const switchNodes = Array.isArray(model.switchNodes) ? model.switchNodes : [];
+    const slaveNodes = Array.isArray(model.slaveNodes) ? model.slaveNodes : [];
 
-    if (!fritzUid) {
-      this._setHTML(title, `
-        <div class="msg warn">
-          ${ICON.unknown}
-          Entity <code>${esc(this._config.entity)}</code> is not a master mesh node sensor
-          (missing <code>fritz_unique_id</code> attribute).
-        </div>`);
-      return;
-    }
-
-    // Build master node object.
-    const masterNode = {
-      name: masterAttrs.node_name ?? "Fritz!Box",
-      node_type: "master",
-      node_uid: masterAttrs.node_uid ?? "",
-      rx_rate_kbps: masterAttrs.rx_rate_kbps ?? null,
-      tx_rate_kbps: masterAttrs.tx_rate_kbps ?? null,
-      clients: [],
-    };
-
-    // Discover slave and switch nodes from hass.states.
-    const slaveNodes = [];
-    const switchNodes = [];
-    const nodesByName = { [masterNode.name]: masterNode };
-
-    for (const [eid, s] of Object.entries(this._hass.states)) {
-      const a = s?.attributes ?? {};
-      if (
-        eid.startsWith("sensor.") &&
-        a.fritz_unique_id === fritzUid &&
-        a.node_type !== "master" &&
-        a.node_name
-      ) {
-        if (a.node_type === "switch") {
-          const switchNode = {
-            name: a.node_name,
-            node_type: "switch",
-            node_uid: a.node_uid ?? "",
-            rx_rate_kbps: a.rx_rate_kbps ?? null,
-            tx_rate_kbps: a.tx_rate_kbps ?? null,
-            clients: [],
-          };
-          switchNodes.push(switchNode);
-          nodesByName[a.node_uid] = switchNode;
-        } else {
-          const slave = {
-            name: a.node_name,
-            node_type: "slave",
-            node_uid: a.node_uid ?? "",
-            rx_rate_kbps: a.rx_rate_kbps ?? null,
-            tx_rate_kbps: a.tx_rate_kbps ?? null,
-            parent_link_type: "LAN", // resolved below
-            parent_node: a.parent_node ?? null, // set by backend for LAN-backhaul slaves
-            clients: [],
-          };
-          slaveNodes.push(slave);
-          nodesByName[a.node_name] = slave;
-        }
-      }
-    }
-
-    // Assign clients from device_tracker entities.
-    // Also capture the mesh SSID from the first connected WiFi client found.
+    // Capture mesh SSID from first connected WiFi client visible in the model.
     let meshSsid = null;
-    for (const [eid, s] of Object.entries(this._hass.states)) {
-      if (!eid.startsWith("device_tracker.")) continue;
-      const a = s?.attributes ?? {};
-      const connectedTo = a.connected_to;
-      if (!connectedTo || !(connectedTo in nodesByName)) continue;
-
-      if (!meshSsid && a.ssid && a.connection_type === "WLAN") {
-        meshSsid = a.ssid;
-      }
-
-      const node = nodesByName[connectedTo];
-      node.clients.push({
-        name: a.host_name || a.friendly_name,
-        mac: a.mac,
-        ip: a.ip,
-        connection_type: a.connection_type,
-        wifi_band: a.wifi_band ?? null,
-        // node_name is set on slave device_trackers — used to identify them
-        // as mesh nodes rather than regular client devices.
-        node_name: a.node_name ?? null,
-        connection_state: s.state === "home" ? "CONNECTED" : "DISCONNECTED",
-        cur_rx_kbps: a.cur_rx_kbps ?? null,
-        cur_tx_kbps: a.cur_tx_kbps ?? null,
-        ha_entity_id: eid,
-      });
-    }
-
-    // Determine each slave's uplink type from its device_tracker (if present).
-    // parent_node from the sensor attribute takes priority and is not overwritten.
-    if (slaveNodes.length) {
-      for (const slave of slaveNodes) {
-        if (!slave.node_uid) continue;
-        const macNorm = slave.node_uid.toUpperCase().replace(/[^0-9A-F]/g, "");
-        for (const [eid, s] of Object.entries(this._hass.states)) {
-          if (!eid.startsWith("device_tracker.")) continue;
-          const a = s?.attributes ?? {};
-          const tMac = String(a.mac || "").toUpperCase().replace(/[^0-9A-F]/g, "");
-          if (tMac && tMac === macNorm) {
-            slave.parent_link_type = a.connection_type || "LAN";
-            if (!slave.parent_node) slave.parent_node = a.connected_to ?? null;
-            break;
-          }
-        }
-      }
-    }
-
-    // Attach slaves whose uplink goes via a switch as children of that switch.
-    // They will be rendered nested inside the switch section instead of at root.
-    const switchKeysByMac = new Set(switchNodes.map((sw) => sw.node_uid));
-    for (const slave of slaveNodes) {
-      if (slave.parent_node && switchKeysByMac.has(slave.parent_node)) {
-        const parentSwitch = nodesByName[slave.parent_node];
-        parentSwitch.slaveChildren = parentSwitch.slaveChildren ?? [];
-        parentSwitch.slaveChildren.push(slave);
-        slave._renderedUnderSwitch = true;
+    const allNodes = [masterNode, ...slaveNodes, ...switchNodes];
+    for (const n of allNodes) {
+      const wifiClient = (n?.clients || []).find(
+        (c) => c?.connection_type === "WLAN" && c?.connection_state === "CONNECTED" && c?.ssid
+      );
+      if (wifiClient?.ssid) {
+        meshSsid = wifiClient.ssid;
+        break;
       }
     }
 
@@ -560,7 +733,7 @@ class FritzMeshCard extends HTMLElement {
 
     // Update size tracking for getCardSize().
     this._nodeCount   = 1 + slaveNodes.length + switchNodes.length;
-    this._clientCount = Object.values(nodesByName).reduce((s, n) => s + n.clients.length, 0);
+    this._clientCount = allNodes.reduce((sum, n) => sum + (n?.clients?.length || 0), 0);
 
     // Remove switch-attached slaves from the root list and from the switch's
     // plain client rows (they'll be rendered as nested slave sections instead).
@@ -580,7 +753,7 @@ class FritzMeshCard extends HTMLElement {
 
     this._setHTML(
       title,
-      this._masterPanel(masterNode, fritzHost, meshSsid),
+      this._masterPanel(masterNode, masterNode.host || "", meshSsid),
       this._masterSection(masterNode)
         + slaves.map((node) => this._slaveSection(node)).join("")
         + switchNodes.map((node) => this._switchSection(node)).join("")
