@@ -1,22 +1,14 @@
 /**
- * Fritz!Box Mesh Topology Card  –  v3.0
+ * Fritz!Box Mesh Topology Card
  *
  * A custom Lovelace card that visualises the Fritz!Box mesh network as a
  * hierarchical tree diagram.  Data is read directly from the standard
  * fritz integration entities (no custom fritzmesh component needed):
  *
- *   • sensor.*_mesh_connected_devices  – one per mesh node (master, slaves, and switches);
- *     carries node_name, node_type, fritz_unique_id, fritz_host, node_uid,
- *     rx_rate_kbps, tx_rate_kbps in its attributes.
- *   • device_tracker.*                 – one per client device; carries
- *     connected_to, connection_type, ip, mac, cur_rx_kbps, cur_tx_kbps.
- *     Slave repeaters that appear in the hosts list also get a tracker with
- *     connection_type reflecting their uplink.
- *
  * Card YAML configuration:
  *   type: custom:fritzmesh-card
- *   device_name: FRITZ!Box 7530           # required – fritz device name
- *   update_interval: 60                   # optional; refresh every 60 seconds
+ *   device_name: FRITZ!Box 7530         # required – fritz device name
+ *   update_interval: 60                 # optional; refresh every 60 seconds
  *   title: Fritz!Box Mesh               # optional; omit to use default title,
  *                                       # set to "" to hide the header entirely
  *   hide_offline_nodes: true            # optional; hide disconnected clients
