@@ -1,14 +1,22 @@
 /**
- * Fritz!Box Mesh Topology Card
+ * Fritz!Box Mesh Topology Card  –  v3.0
  *
  * A custom Lovelace card that visualises the Fritz!Box mesh network as a
- * hierarchical tree diagram.  
- * Data is read directly from the standard fritz integration
+ * hierarchical tree diagram.  Data is read directly from the standard
+ * fritz integration entities (no custom fritzmesh component needed):
+ *
+ *   • sensor.*_mesh_connected_devices  – one per mesh node (master, slaves, and switches);
+ *     carries node_name, node_type, fritz_unique_id, fritz_host, node_uid,
+ *     rx_rate_kbps, tx_rate_kbps in its attributes.
+ *   • device_tracker.*                 – one per client device; carries
+ *     connected_to, connection_type, ip, mac, cur_rx_kbps, cur_tx_kbps.
+ *     Slave repeaters that appear in the hosts list also get a tracker with
+ *     connection_type reflecting their uplink.
  *
  * Card YAML configuration:
  *   type: custom:fritzmesh-card
- *   device_name: FRITZ!Box 7530         # required – fritz device name
- *   update_interval: 60                 # optional; refresh every 60 seconds
+ *   device_name: FRITZ!Box 7530           # required – fritz device name
+ *   update_interval: 60                   # optional; refresh every 60 seconds
  *   title: Fritz!Box Mesh               # optional; omit to use default title,
  *                                       # set to "" to hide the header entirely
  *   hide_offline_nodes: true            # optional; hide disconnected clients
@@ -226,7 +234,7 @@ class FritzMeshCard extends HTMLElement {
     this._startRefreshLoop();
   }
 
-  _getConfiguredDeviceConfigEntryId() {
+  _getConfiguredDeviceId() {
     if (!this._config?.device_name || !this._hass?.devices) return null;
 
     const device = Object.values(this._hass.devices).find((device) => {
@@ -235,16 +243,16 @@ class FritzMeshCard extends HTMLElement {
       return name === this._config.device_name || nameByUser === this._config.device_name;
     });
 
-    return device?.config_entries?.[0] ?? null;
+    return device?.id ?? null;
   }
 
   _queryFritzMeshDataAndRender() {
     if (!this._config || !this._hass) return;
 
-    const configEntryId = this._getConfiguredDeviceConfigEntryId();
-    if (!configEntryId) {
+    const deviceId = this._getConfiguredDeviceId();
+    if (!deviceId) {
       console.warn(
-        `fritzmesh-card: could not resolve config_entry_id for device ${this._config.device_name}`
+        `fritzmesh-card: could not resolve device_id for device ${this._config.device_name}`
       );
       return;
     }
@@ -254,7 +262,7 @@ class FritzMeshCard extends HTMLElement {
       this._hass.callService(
         'fritz',          // Domain
         'get_mesh_info',    // Service / Action
-        { config_entry_id: configEntryId },  // Service Data (Felder)
+        { device_id: deviceId },  // Service Data (Felder)
         {}, // Target (Zielgerät)
         true,               // Optionaler interner Flag
         true                // returnResponse: ZWINGEND ERFORDERLICH für Antwortdaten!
